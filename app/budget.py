@@ -4,10 +4,14 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime
 
+from .config import EPSILON
 from .schemas import (
+    MAX_LUX,
     STANDARD_ANNUAL_LIMITS,
     ExhibitBudgetOut,
     LightingPreviewExhibitOut,
+    SafeLuxExhibitOut,
+    SafeLuxLimitOut,
     Sensitivity,
 )
 from .timeline import (
@@ -174,3 +178,95 @@ def resolve_limit(sensitivity: Sensitivity, override: float | None) -> float | N
     if override is not None:
         return override
     return STANDARD_ANNUAL_LIMITS[sensitivity]
+
+
+def build_safe_lux_limit(
+    showcase: sqlite3.Row,
+    exhibits: list[sqlite3.Row],
+    intervals: list[tuple[int, datetime, datetime, float]],
+    start: datetime,
+    end: datetime,
+) -> SafeLuxLimitOut:
+    """核算计划时段 [start, end) 内可追加的最大整数照度（只读试算，不落库）。
+
+    以该年已有区间合并（重叠取最大照度）的时间线为基线；把候选区间按照度 L
+    重新合并后积分全年曝光。同一展柜的展品共享时间线，曝光关于 L 单调不减，
+    因此可二分最大整数 L ∈ [0, MAX_LUX]，使所有有限额展品的年度曝光都不越过
+    各自上限（恰好到限不算超标，沿用 EPSILON 容差）。
+    """
+    start, end = parse_utc(start), parse_utc(end)
+    year = start.year  # 入口校验已保证起止同年（UTC）
+    year_start, next_year = year_bounds(year)
+    base = [(s, e, x) for _, s, e, x in intervals]
+    base_total = integrate_within(merge_intervals(base), year_start, next_year)
+
+    limited: list[tuple[sqlite3.Row, float]] = []
+    for exhibit in exhibits:
+        limit = _effective_limit(exhibit)
+        if limit is not None:
+            limited.append((exhibit, limit))
+
+    header = {
+        "showcase_id": showcase["id"],
+        "showcase_name": showcase["name"],
+        "year": year,
+        "start": start,
+        "end": end,
+    }
+
+    if not limited:
+        # 没有有限额展品：照度直接顶到协议上限
+        return SafeLuxLimitOut(
+            **header, feasible=True, max_safe_lux=int(MAX_LUX),
+            binding_exhibits=[], exceeded_exhibits=[],
+        )
+
+    def _exhibit_out(exhibit, limit: float, total: float, floor_zero: bool = False):
+        remaining = limit - total
+        if floor_zero:  # 可行解处剩余额度最多负一个 EPSILON，归零避免输出 -0.0
+            remaining = max(remaining, 0.0)
+        return SafeLuxExhibitOut(
+            exhibit_id=exhibit["id"],
+            exhibit_name=exhibit["name"],
+            annual_limit_lux_hours=_r(limit),
+            remaining_lux_hours=_r(remaining),
+        )
+
+    # 现状已超限：不可行，只报告超限展品，不给出安全上限
+    exceeded = [
+        _exhibit_out(e, lim, base_total)
+        for e, lim in limited
+        if base_total > lim + EPSILON
+    ]
+    if exceeded:
+        return SafeLuxLimitOut(
+            **header, feasible=False, max_safe_lux=None,
+            binding_exhibits=[], exceeded_exhibits=exceeded,
+        )
+
+    min_limit = min(lim for _, lim in limited)
+
+    def total_with(lux: float) -> float:
+        segments = merge_intervals(base + [(start, end, lux)])
+        return integrate_within(segments, year_start, next_year)
+
+    # total_with 关于 lux 单调不减；total_with(0) == base_total 必可行
+    lo, hi = 0, int(MAX_LUX)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if total_with(mid) <= min_limit + EPSILON:
+            lo = mid
+        else:
+            hi = mid - 1
+
+    # 共享同一时间线 ⇒ 最终曝光相同，剩余额度最少即上限最小的展品（可并列）
+    final_total = total_with(lo)
+    binding = [
+        _exhibit_out(e, lim, final_total, floor_zero=True)
+        for e, lim in limited
+        if lim <= min_limit + EPSILON
+    ]
+    return SafeLuxLimitOut(
+        **header, feasible=True, max_safe_lux=lo,
+        binding_exhibits=binding, exceeded_exhibits=[],
+    )

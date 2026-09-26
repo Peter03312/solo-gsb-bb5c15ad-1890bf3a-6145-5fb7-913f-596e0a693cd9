@@ -115,6 +115,59 @@ curl -s -X POST localhost:8000/api/v1/showcases/1/lighting-preview \
 }
 ```
 
+安全照度上限试算（不落库）：计划 9-20 08:00–16:00 追加一段照明，求该时段内可使用的
+**最大整数照度**。以该年既有区间合并（重叠取 max）的时间线为基线，候选区间按不同照度
+重新合并并逐件核算全年曝光，仅当所有有限额展品都不越过各自年度上限时可行：
+
+```bash
+curl -s -X POST localhost:8000/api/v1/showcases/1/safe-lux-limit \
+  -H 'Content-Type: application/json' \
+  -d '{"start": "2026-09-20T08:00:00Z", "end": "2026-09-20T16:00:00Z"}'
+```
+
+展柜 1 现状年度曝光 850 lux·h 已超过绢画上限 500，返回不可行与超限展品（不给出安全上限）：
+
+```json
+{
+  "showcase_id": 1,
+  "showcase_name": "敦煌展厅A柜",
+  "year": 2026,
+  "start": "2026-09-20T08:00:00Z",
+  "end": "2026-09-20T16:00:00Z",
+  "feasible": false,
+  "max_safe_lux": null,
+  "binding_exhibits": [],
+  "exceeded_exhibits": [{
+    "exhibit_id": 1,
+    "exhibit_name": "唐代绢画",
+    "annual_limit_lux_hours": 500.0,
+    "remaining_lux_hours": -350.0
+  }]
+}
+```
+
+换一个未超限的场景（年度上限 1200、现状 600 lux·h、计划时段 8h 无既有照明）：
+`600 + 8L ≤ 1200` → 最大整数照度 75 lux，瓶颈展品剩余额度恰好为 0：
+
+```json
+{
+  "showcase_id": 2,
+  "showcase_name": "书画展厅B柜",
+  "year": 2026,
+  "start": "2026-09-20T08:00:00Z",
+  "end": "2026-09-20T16:00:00Z",
+  "feasible": true,
+  "max_safe_lux": 75,
+  "binding_exhibits": [{
+    "exhibit_id": 2,
+    "exhibit_name": "宋代山水卷",
+    "annual_limit_lux_hours": 1200.0,
+    "remaining_lux_hours": 0.0
+  }],
+  "exceeded_exhibits": []
+}
+```
+
 ## 计算规则
 
 - **时间线合并**：把展柜所有区间的开/关灯时刻作为事件扫描；任意时刻有多盏灯亮，有效照度取
@@ -132,6 +185,13 @@ curl -s -X POST localhost:8000/api/v1/showcases/1/lighting-preview \
 - **照明调整试算**：`POST .../lighting-preview` 在查询日所属 UTC 公历年内，对 现状区间 与
   "撤去 `remove_interval_ids` + 新增 `add_intervals`" 后的区间分别执行同一套合并与曝光积分，
   按展品返回两侧年度曝光、差额与首次越限时刻；全程只读，不改动已存区间。
+- **安全照度上限**：`POST .../safe-lux-limit` 传入计划照明起止时间（UTC 归一化后须起点早于
+  终点且处于同一公历年），以该年既有区间合并（重叠取 max）的时间线为基线，把候选区间按照度
+  L 重新合并并积分全年曝光；曝光关于 L 单调不减，故二分求 0～100000 间的最大整数照度，使
+  全部有限额展品年度曝光都不越过各自上限（恰好到限不算超标）。返回 `max_safe_lux` 与该上限
+  处年度剩余额度最少的瓶颈展品 `binding_exhibits`（共享同一时间线，瓶颈即上限最小者，可并列）；
+  无有限额展品时返回 100000 lux 与空列表；现状已超限则 `feasible=false`、`max_safe_lux=null`
+  并在 `exceeded_exhibits` 列出超限展品（剩余额度为负）。全程只读，不改动已存区间。
 - **时间**：接受带时区 ISO 8601；naive 时间视为 UTC；内部统一 UTC 存储与返回。
 
 ### 敏感度默认年度上限
@@ -148,6 +208,7 @@ curl -s -X POST localhost:8000/api/v1/showcases/1/lighting-preview \
 
 - **负照度**：`lux < 0` → `422`（照度上限 100,000 lux）。
 - **反向 / 零长度区间**：`end <= start` → `422`。
+- **安全照度上限时段**：UTC 归一化后 `end <= start`，或起止时间不处于同一公历年 → `422`。
 - **未知展品 / 未知展柜**：查询或向不存在的展柜提交数据 → `404`。
 - **试算撤去项**：`remove_interval_ids` 含不存在或不属于该展柜的区间 ID → `404`。
 - 非有限数值（NaN / Infinity）→ `422`；重名冲突 → `409`。
@@ -167,6 +228,7 @@ curl -s -X POST localhost:8000/api/v1/showcases/1/lighting-preview \
 | PATCH | `/api/v1/exhibits/{id}` | 展品移柜（目标柜未知 → 404） |
 | POST | `/api/v1/showcases/{id}/intervals` | **批量提交照明区间** |
 | POST | `/api/v1/showcases/{id}/lighting-preview` | **照明调整试算**（撤去/新增区间，不落库） |
+| POST | `/api/v1/showcases/{id}/safe-lux-limit` | **安全照度上限**（计划时段可追加的最大整数照度，不落库） |
 | GET | `/api/v1/showcases/{id}/intervals?day=YYYY-MM-DD` | 区间查询，**可按日期过滤** |
 | GET | `/api/v1/showcases/{id}/budget?day=YYYY-MM-DD` | **按展柜 + 日期查预算** |
 | GET | `/api/v1/exhibits/{id}/budget?day=YYYY-MM-DD` | 按单件展品查预算 |
@@ -187,7 +249,7 @@ app/
 └── routers/
     ├── showcases.py   # 展柜 / 展品 / 照明区间
     └── reports.py     # 预算查询
-tests/                 # pytest：算法单测 + API 集成测试（22 项）
+tests/                 # pytest：算法单测 + API 集成测试（35 项）
 Dockerfile             # python:3.12-slim + HEALTHCHECK
 docker-compose.yml     # 单命令启动 + 数据卷
 ```
@@ -200,4 +262,5 @@ pytest -q
 ```
 
 覆盖：重叠取 max、多灯合并、首尾相接、跨年裁剪、超标插值、恰好到限不超标、负照度/反向区间/
-未知展柜拒绝、按日期过滤、重启持久化等。
+未知展柜拒绝、按日期过滤、安全照度上限（二分最大整数照度、瓶颈展品、现状超限不可行、跨年
+时段拒绝、只读性）、重启持久化等。

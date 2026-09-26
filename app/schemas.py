@@ -125,6 +125,58 @@ class MergedSegmentOut(BaseModel):
     lux: float
 
 
+class SafeLuxLimitIn(BaseModel):
+    """安全照度上限试算请求：计划照明的起止时间。
+
+    归一化到 UTC 后要求起点早于终点，且二者处于同一公历年。
+    """
+
+    start: datetime = Field(description="计划照明开始时间；不带时区视为 UTC")
+    end: datetime = Field(description="计划照明结束时间；不带时区视为 UTC")
+
+    @model_validator(mode="after")
+    def _check_range(self) -> "SafeLuxLimitIn":
+        start, end = to_utc(self.start), to_utc(self.end)
+        if end <= start:
+            raise ValueError("计划照明结束时间必须晚于开始时间（不接受反向或零长度区间）")
+        if start.year != end.year:
+            raise ValueError("计划照明起止时间必须处于同一公历年（UTC 归一化后）")
+        self.start, self.end = start, end
+        return self
+
+
+class SafeLuxExhibitOut(BaseModel):
+    """安全照度上限核算涉及的有限额展品及其年度剩余额度。"""
+
+    exhibit_id: int
+    exhibit_name: str
+    annual_limit_lux_hours: float
+    remaining_lux_hours: float = Field(
+        description="年度剩余额度 = 年度上限 − 年度曝光；负值表示已超限"
+    )
+
+
+class SafeLuxLimitOut(BaseModel):
+    showcase_id: int
+    showcase_name: str
+    year: int
+    start: datetime = Field(description="归一化到 UTC 的计划开始时间")
+    end: datetime = Field(description="归一化到 UTC 的计划结束时间")
+    feasible: bool = Field(description="现状是否未超限、允许追加照明")
+    max_safe_lux: Optional[int] = Field(
+        default=None,
+        description="计划时段内可追加的最大整数照度（0～100000 lux）；现状已超限时为 null",
+    )
+    binding_exhibits: list[SafeLuxExhibitOut] = Field(
+        default_factory=list,
+        description="安全上限处年度剩余额度最少的展品（可并列）；无有限额展品或不可行时为空",
+    )
+    exceeded_exhibits: list[SafeLuxExhibitOut] = Field(
+        default_factory=list,
+        description="现状已超出各自年度上限的展品；feasible=true 时为空",
+    )
+
+
 class LightingPreviewIn(BaseModel):
     """照明调整试算请求：撤去 / 新增仅在内存中演算，不写入数据库。"""
 

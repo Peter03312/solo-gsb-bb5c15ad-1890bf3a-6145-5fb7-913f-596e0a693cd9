@@ -395,3 +395,223 @@ def test_persistence_across_connections(client, tmp_path):
     with TestClient(app.main.app) as second:
         r = second.get(f"/api/v1/showcases/{case_id}/exhibits")
         assert r.status_code == 200 and r.json()[0]["name"] == "敦煌写经"
+
+
+# ------------------------------------------------------------- 安全照度上限
+
+def test_safe_lux_limit_basic(client):
+    """已有 500 lux·h（10h×50），计划时段 8h 无灯：500+8L ≤ 1000 → L=62，剩余 4。"""
+    case_id = _create_case(client, name="安全上限柜")
+    client.post(
+        f"/api/v1/showcases/{case_id}/exhibits",
+        json={"name": "绢画", "sensitivity": "high", "annual_limit_lux_hours": 1000},
+    )
+    client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T08:00:00Z", "end": "2026-03-01T18:00:00Z", "lux": 50}
+        ]},
+    )
+    r = client.post(
+        f"/api/v1/showcases/{case_id}/safe-lux-limit",
+        json={"start": "2026-03-02T08:00:00Z", "end": "2026-03-02T16:00:00Z"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["feasible"] is True
+    assert body["year"] == 2026
+    assert body["max_safe_lux"] == 62  # 500+8*62=996 ≤ 1000 < 500+8*63=1004
+    assert body["exceeded_exhibits"] == []
+    binding = body["binding_exhibits"]
+    assert len(binding) == 1
+    assert binding[0]["exhibit_name"] == "绢画"
+    assert binding[0]["annual_limit_lux_hours"] == 1000.0
+    assert binding[0]["remaining_lux_hours"] == 4.0
+
+
+def test_safe_lux_limit_overlap_takes_max(client):
+    """计划时段内已有 100 lux：L≤100 不增曝光；L>100 时 8L ≤ 1000 → L=125，剩余 0。"""
+    case_id = _create_case(client, name="安全上限重叠柜")
+    client.post(
+        f"/api/v1/showcases/{case_id}/exhibits",
+        json={"name": "字画", "sensitivity": "high", "annual_limit_lux_hours": 1000},
+    )
+    client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-02T08:00:00Z", "end": "2026-03-02T16:00:00Z", "lux": 100}
+        ]},
+    )
+    r = client.post(
+        f"/api/v1/showcases/{case_id}/safe-lux-limit",
+        json={"start": "2026-03-02T08:00:00Z", "end": "2026-03-02T16:00:00Z"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["max_safe_lux"] == 125  # 8*125=1000 恰好到限；8*126=1008 超限
+    assert body["binding_exhibits"][0]["remaining_lux_hours"] == 0.0
+
+
+def test_safe_lux_limit_binding_picks_tightest_exhibit(client):
+    """多件有限额展品共享时间线：瓶颈为上限最小者，并列时全部返回。"""
+    case_id = _create_case(client, name="安全上限多展品柜")
+    for name, limit in [("甲", 2000), ("乙", 1000), ("丙", 1000)]:
+        client.post(
+            f"/api/v1/showcases/{case_id}/exhibits",
+            json={"name": name, "sensitivity": "medium", "annual_limit_lux_hours": limit},
+        )
+    client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T08:00:00Z", "end": "2026-03-01T18:00:00Z", "lux": 50}
+        ]},
+    )
+    r = client.post(
+        f"/api/v1/showcases/{case_id}/safe-lux-limit",
+        json={"start": "2026-03-02T08:00:00Z", "end": "2026-03-02T16:00:00Z"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["max_safe_lux"] == 62  # 受上限最小的 1000 约束
+    names = [e["exhibit_name"] for e in body["binding_exhibits"]]
+    assert names == ["乙", "丙"]  # 甲剩余 1004，不在瓶颈列表
+    assert all(e["remaining_lux_hours"] == 4.0 for e in body["binding_exhibits"])
+
+
+def test_safe_lux_limit_no_limited_exhibits(client):
+    """无有限额展品：直接返回协议上限 100000 lux 与空展品列表。"""
+    case_id = _create_case(client, name="安全上限不限量柜")
+    client.post(
+        f"/api/v1/showcases/{case_id}/exhibits",
+        json={"name": "石雕", "sensitivity": "low"},
+    )
+    r = client.post(
+        f"/api/v1/showcases/{case_id}/safe-lux-limit",
+        json={"start": "2026-03-02T08:00:00Z", "end": "2026-03-02T16:00:00Z"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["feasible"] is True
+    assert body["max_safe_lux"] == 100000
+    assert body["binding_exhibits"] == []
+    assert body["exceeded_exhibits"] == []
+
+
+def test_safe_lux_limit_already_exceeded(client):
+    """现状已超限：不可行，报告超限展品与负剩余额度，不给出安全上限。"""
+    case_id = _create_case(client, name="安全上限超限柜")
+    client.post(
+        f"/api/v1/showcases/{case_id}/exhibits",
+        json={"name": "丝帛", "sensitivity": "high", "annual_limit_lux_hours": 500},
+    )
+    client.post(
+        f"/api/v1/showcases/{case_id}/exhibits",
+        json={"name": "陶俑", "sensitivity": "medium", "annual_limit_lux_hours": 100000},
+    )
+    client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T08:00:00Z", "end": "2026-03-01T18:00:00Z", "lux": 50},
+            {"start": "2026-03-01T12:00:00Z", "end": "2026-03-01T13:00:00Z", "lux": 100},
+        ]},
+    )
+    # 现状年度曝光 = 50*4 + 100*1 + 50*5 = 550 > 500
+    r = client.post(
+        f"/api/v1/showcases/{case_id}/safe-lux-limit",
+        json={"start": "2026-03-02T08:00:00Z", "end": "2026-03-02T16:00:00Z"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["feasible"] is False
+    assert body["max_safe_lux"] is None
+    assert body["binding_exhibits"] == []
+    exceeded = body["exceeded_exhibits"]
+    assert [e["exhibit_name"] for e in exceeded] == ["丝帛"]  # 陶俑未超限
+    assert exceeded[0]["remaining_lux_hours"] == -50.0
+
+
+def test_safe_lux_limit_exactly_at_limit_allows_zero(client):
+    """现状恰好到限不算超限：可追加照度为 0，瓶颈展品剩余额度为 0。"""
+    case_id = _create_case(client, name="安全上限到限柜")
+    client.post(
+        f"/api/v1/showcases/{case_id}/exhibits",
+        json={"name": "纸本", "sensitivity": "high", "annual_limit_lux_hours": 500},
+    )
+    client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T08:00:00Z", "end": "2026-03-01T18:00:00Z", "lux": 50}
+        ]},
+    )
+    r = client.post(
+        f"/api/v1/showcases/{case_id}/safe-lux-limit",
+        json={"start": "2026-03-02T08:00:00Z", "end": "2026-03-02T16:00:00Z"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["feasible"] is True
+    assert body["max_safe_lux"] == 0
+    assert body["binding_exhibits"][0]["remaining_lux_hours"] == 0.0
+
+
+def test_safe_lux_limit_validation(client):
+    """反向 / 零长度 / 跨年（含时区归一化后跨年）→ 422；未知展柜 → 404。"""
+    case_id = _create_case(client, name="安全上限校验柜")
+    url = f"/api/v1/showcases/{case_id}/safe-lux-limit"
+
+    # 反向区间
+    r = client.post(url, json={
+        "start": "2026-03-02T16:00:00Z", "end": "2026-03-02T08:00:00Z"})
+    assert r.status_code == 422 and "结束时间" in r.text
+    # 零长度区间
+    r = client.post(url, json={
+        "start": "2026-03-02T08:00:00Z", "end": "2026-03-02T08:00:00Z"})
+    assert r.status_code == 422
+    # UTC 下跨年
+    r = client.post(url, json={
+        "start": "2026-12-31T20:00:00Z", "end": "2027-01-01T04:00:00Z"})
+    assert r.status_code == 422 and "同一公历年" in r.text
+    # 带时区提交，归一化到 UTC 后跨年：2026-01-01 00:30 (+08:00) → UTC 2025-12-31 16:30
+    r = client.post(url, json={
+        "start": "2026-01-01T00:30:00+08:00", "end": "2026-06-01T00:00:00Z"})
+    assert r.status_code == 422 and "同一公历年" in r.text
+    # 未知展柜
+    r = client.post("/api/v1/showcases/4242/safe-lux-limit", json={
+        "start": "2026-03-02T08:00:00Z", "end": "2026-03-02T16:00:00Z"})
+    assert r.status_code == 404
+
+
+def test_safe_lux_limit_read_only_and_time_normalized(client):
+    """naive 时间视为 UTC、带时区时间归一化为 UTC 返回；全程只读不改库。"""
+    case_id = _create_case(client, name="安全上限只读柜")
+    client.post(
+        f"/api/v1/showcases/{case_id}/exhibits",
+        json={"name": "绢画", "sensitivity": "high", "annual_limit_lux_hours": 1000},
+    )
+    client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T08:00:00Z", "end": "2026-03-01T18:00:00Z", "lux": 50}
+        ]},
+    )
+    before_budget = client.get(
+        f"/api/v1/showcases/{case_id}/budget?day=2026-03-01").json()
+    before_intervals = client.get(f"/api/v1/showcases/{case_id}/intervals").json()
+
+    # naive 起 + 带时区止：2026-03-03 00:00 (+08:00) → UTC 2026-03-02 16:00
+    r = client.post(
+        f"/api/v1/showcases/{case_id}/safe-lux-limit",
+        json={"start": "2026-03-02T08:00:00", "end": "2026-03-03T00:00:00+08:00"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["start"].startswith("2026-03-02T08:00:00")
+    assert body["end"].startswith("2026-03-02T16:00:00")
+    assert body["start"].endswith(("+00:00", "Z"))
+    assert body["end"].endswith(("+00:00", "Z"))
+    assert body["max_safe_lux"] == 62  # 与 UTC 08:00-16:00 场景一致
+
+    # 只读：预算与已存区间均不变
+    assert client.get(
+        f"/api/v1/showcases/{case_id}/budget?day=2026-03-01").json() == before_budget
+    assert client.get(f"/api/v1/showcases/{case_id}/intervals").json() == before_intervals
