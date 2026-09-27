@@ -6,7 +6,12 @@ from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from ..budget import build_exhibit_preview, load_case_intervals, resolve_limit
+from ..budget import (
+    build_exhibit_preview,
+    build_safe_lux_report,
+    load_case_intervals,
+    resolve_limit,
+)
 from ..database import get_db
 from ..schemas import (
     ExhibitCreate,
@@ -16,6 +21,8 @@ from ..schemas import (
     LightIntervalOut,
     LightingPreviewIn,
     LightingPreviewOut,
+    SafeLuxOut,
+    SafeLuxQueryIn,
     ShowcaseCreate,
     ShowcaseOut,
 )
@@ -246,3 +253,15 @@ def lighting_preview(showcase_id: int, body: LightingPreviewIn, conn=Depends(get
             for e in exhibits
         ],
     }
+
+
+# ------------------------------------------------------------- 安全照度上限
+
+@router.post(
+    "/showcases/{showcase_id}/safe-lux",
+    response_model=SafeLuxOut,
+    summary="安全照度上限：计划时段内可追加的最大整数照度（只读试算，不落库）",
+)
+def safe_lux_limit(showcase_id: int, body: SafeLuxQueryIn, conn=Depends(get_db)):
+    showcase = _get_showcase(conn, showcase_id)
+    return build_safe_lux_report(conn, showcase, body.start, body.end)

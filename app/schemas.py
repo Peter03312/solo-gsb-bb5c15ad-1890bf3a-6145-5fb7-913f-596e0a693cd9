@@ -171,6 +171,65 @@ class LightingPreviewOut(BaseModel):
     exhibits: list[LightingPreviewExhibitOut]
 
 
+class SafeLuxQueryIn(BaseModel):
+    """安全照度上限试算请求：计划照明的起止时间（只读演算，不写入数据库）。
+
+    起止时间归一化到 UTC 后，必须起点早于终点且处于同一公历年。
+    """
+
+    start: datetime = Field(description="计划照明开始时间；不带时区视为 UTC")
+    end: datetime = Field(description="计划照明结束时间；不带时区视为 UTC")
+
+    @model_validator(mode="after")
+    def _check_range(self) -> "SafeLuxQueryIn":
+        start, end = to_utc(self.start), to_utc(self.end)
+        if end <= start:
+            raise ValueError("照明区间结束时间必须晚于开始时间（不接受反向或零长度区间）")
+        if start.year != end.year:
+            raise ValueError("计划照明的起止时间必须处于同一公历年（UTC 归一化后判定）")
+        self.start, self.end = start, end
+        return self
+
+
+class SafeLuxBindingExhibitOut(BaseModel):
+    """安全照度上限处年度剩余额度最少的（瓶颈）展品。"""
+
+    exhibit_id: int
+    exhibit_name: str
+    annual_limit_lux_hours: float
+    remaining_lux_hours: float = Field(description="该上限处的年度剩余额度（lux·hour）")
+
+
+class SafeLuxExceededExhibitOut(BaseModel):
+    """现状（不追加任何照明）已超出年度上限的展品。"""
+
+    exhibit_id: int
+    exhibit_name: str
+    annual_limit_lux_hours: float
+    exceeded_lux_hours: float = Field(description="现状全年曝光超出年度上限的量（lux·hour）")
+
+
+class SafeLuxOut(BaseModel):
+    showcase_id: int
+    showcase_name: str
+    year: int = Field(description="计划照明所属公历年（UTC）")
+    start: datetime = Field(description="归一化到 UTC 的计划照明开始时间")
+    end: datetime = Field(description="归一化到 UTC 的计划照明结束时间")
+    feasible: bool = Field(description="是否存在可追加的安全照度；现状已超限时为 false")
+    max_safe_lux: Optional[int] = Field(
+        default=None,
+        description="可追加的最大整数照度（0～100000 lux）；不可行时为 null",
+    )
+    binding_exhibits: list[SafeLuxBindingExhibitOut] = Field(
+        default_factory=list,
+        description="安全上限处年度剩余额度最少的展品（可并列）；无有限额展品时为空",
+    )
+    exceeded_exhibits: list[SafeLuxExceededExhibitOut] = Field(
+        default_factory=list,
+        description="现状已超限的展品；仅 feasible=false 时非空",
+    )
+
+
 class ExhibitBudgetOut(BaseModel):
     exhibit_id: int
     exhibit_name: str
